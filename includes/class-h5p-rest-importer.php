@@ -166,6 +166,12 @@ class H5P_REST_Importer {
 
         $content_id = $wpdb->insert_id;
 
+        // Medien-Dateien aus extrahiertem Paket ins H5P-Upload-Verzeichnis kopieren
+        $this->copy_content_media($uploaded_folder, $content_id);
+
+        // Bibliotheks-Abhängigkeiten registrieren
+        $this->register_content_libraries($content_id, $library_id, $main_json_data);
+
         // Temp-Dateien aufräumen
         @unlink($tmp_path);
         $this->cleanup_temp_dir($tmp_dir);
@@ -248,6 +254,129 @@ class H5P_REST_Importer {
              WHERE c.id = %d",
             $content_id
         ));
+    }
+
+    /**
+     * Medien-Dateien aus extrahiertem H5P-Paket ins Upload-Verzeichnis kopieren
+     *
+     * H5P-Pakete können eingebettete Bilder, Audio und Video enthalten.
+     * Diese müssen nach wp-content/uploads/h5p/content/{id}/ kopiert werden.
+     *
+     * @param string $uploaded_folder Pfad zum extrahierten H5P-Ordner
+     * @param int $content_id H5P Content ID
+     */
+    private function copy_content_media($uploaded_folder, $content_id) {
+        $content_source = $uploaded_folder . '/content/';
+        $upload_dir = wp_upload_dir();
+        $content_dest = $upload_dir['basedir'] . '/h5p/content/' . $content_id;
+
+        if (!is_dir($content_source)) {
+            return;
+        }
+
+        wp_mkdir_p($content_dest);
+
+        // Alle Dateien kopieren (content.json wird nicht benötigt, da Parameter in DB)
+        $this->copy_directory_contents($content_source, $content_dest, ['content.json']);
+    }
+
+    /**
+     * Verzeichnisinhalt rekursiv kopieren
+     *
+     * @param string $source Quellverzeichnis
+     * @param string $dest Zielverzeichnis
+     * @param array $exclude Dateinamen die ausgeschlossen werden
+     */
+    private function copy_directory_contents($source, $dest, $exclude = []) {
+        $items = scandir($source);
+        foreach ($items as $item) {
+            if ($item === '.' || $item === '..') {
+                continue;
+            }
+            if (in_array($item, $exclude, true)) {
+                continue;
+            }
+
+            $src_path = $source . '/' . $item;
+            $dst_path = $dest . '/' . $item;
+
+            if (is_dir($src_path)) {
+                wp_mkdir_p($dst_path);
+                $this->copy_directory_contents($src_path, $dst_path);
+            } else {
+                copy($src_path, $dst_path);
+            }
+        }
+    }
+
+    /**
+     * Bibliotheks-Abhängigkeiten für H5P-Inhalt registrieren
+     *
+     * Ohne registrierte Dependencies fehlen JS/CSS-Ressourcen beim Rendern.
+     *
+     * @param int $content_id H5P Content ID
+     * @param int $main_library_id ID der Hauptbibliothek
+     * @param array $main_json_data H5P Metadaten (h5p.json)
+     */
+    private function register_content_libraries($content_id, $main_library_id, $main_json_data) {
+        global $wpdb;
+
+        $table = $wpdb->prefix . 'h5p_contents_libraries';
+
+        // Hauptbibliothek registrieren
+        $wpdb->insert($table, [
+            'content_id' => (int) $content_id,
+            'library_id' => (int) $main_library_id,
+            'dependency_type' => 'preloaded',
+            'weight' => 1,
+            'drop_css' => 0,
+        ]);
+
+        // Preloaded Dependencies registrieren
+        if (isset($main_json_data['preloadedDependencies'])) {
+            $weight = 2;
+            foreach ($main_json_data['preloadedDependencies'] as $dep) {
+                if (!isset($dep['machineName'])) {
+                    continue;
+                }
+                // Hauptbibliothek nicht doppelt registrieren
+                $dep_id = $this->find_library_id(
+                    $dep['machineName'],
+                    ['preloadedDependencies' => [$dep]]
+                );
+                if ($dep_id && $dep_id !== $main_library_id) {
+                    $wpdb->insert($table, [
+                        'content_id' => (int) $content_id,
+                        'library_id' => (int) $dep_id,
+                        'dependency_type' => 'preloaded',
+                        'weight' => $weight++,
+                        'drop_css' => 0,
+                    ]);
+                }
+            }
+        }
+
+        // Editor Dependencies registrieren (optional, für Bearbeitungsmodus)
+        if (isset($main_json_data['editorDependencies'])) {
+            foreach ($main_json_data['editorDependencies'] as $dep) {
+                if (!isset($dep['machineName'])) {
+                    continue;
+                }
+                $dep_id = $this->find_library_id(
+                    $dep['machineName'],
+                    ['preloadedDependencies' => [$dep]]
+                );
+                if ($dep_id) {
+                    $wpdb->insert($table, [
+                        'content_id' => (int) $content_id,
+                        'library_id' => (int) $dep_id,
+                        'dependency_type' => 'editor',
+                        'weight' => 0,
+                        'drop_css' => 0,
+                    ]);
+                }
+            }
+        }
     }
 
     /**
